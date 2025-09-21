@@ -1,5 +1,3 @@
-# LinacCenter
-Simulation of throughput for radiotherapy.
 # Radiotherapy Center Simulator
 
 This project is a discrete-event simulation of a radiotherapy treatment center's patient workflow, built using Python, `simpy`, and `tkinter`. It provides a graphical user interface (GUI) to configure various operational parameters and visualizes the impact on patient backlog, treatment capacity, and wait times.
@@ -14,9 +12,10 @@ This project is a discrete-event simulation of a radiotherapy treatment center's
 - **Stochastic Events:**
   - **Machine Breakdowns:** Models random, weekly breakdowns for each LINAC, interrupting a number of patients based on the breakdown duration.
   - **Scheduled Downtime:** Simulates a recurring, center-wide closure day (e.g., for maintenance or training) every 4 weeks, which interrupts all active treatments.
+  - **Dynamic Overtime:** Automatically activates overtime (2 extra hours/day) on LINACs one-by-one when the patient backlog exceeds a set threshold, and scales down when the backlog decreases.
 - **Detailed Metrics & Visualization:**
-  - A real-time plot shows the number of patients in the backlog vs. patients actively on treatment over the simulation period.
-  - A summary report provides key performance indicators like total patients treated, final backlog size, maximum backlog reached, and average/maximum patient wait times.
+  - A real-time plot shows the number of patients in the backlog, patients actively on treatment, and patients being treated in overtime slots.
+  - A summary report provides key performance indicators like total patients treated, backlog sizes, patient wait times, and detailed overtime statistics.
 
 ## Requirements
 
@@ -75,3 +74,7 @@ The application window is divided into several sections:
   - The time already spent on the current day's treatment is recorded.
   - The remaining treatment duration is recalculated.
   - A one-day penalty is added to account for the missed session, extending their overall treatment time.
+- **Overtime Logic:**
+  - An `overtime_manager` process checks the backlog size daily.
+  - If the backlog exceeds 10 patients, it adds one LINAC's worth of capacity (2 hours of treatment slots) to the system. This can repeat on subsequent days until all LINACs are in overtime.
+  - If the backlog drops to 10 or below, it removes overtime capacity one LINAC at a time.
