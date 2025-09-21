@@ -28,6 +28,7 @@ class Patient:
 class RadiotherapyCenter:
     def __init__(self, env, num_linacs, patients_per_hour_linac, treatment_day_hours):
         self.env = env
+        self.patients_per_hour_linac = patients_per_hour_linac
         # Capacity is the total number of patients that can be in treatment concurrently
         daily_sessions_per_linac = treatment_day_hours * patients_per_hour_linac
         total_capacity = num_linacs * daily_sessions_per_linac
@@ -37,11 +38,21 @@ class RadiotherapyCenter:
         # Data for plotting backlog size over time
         self.backlog_data = []
         self.on_treatment_data = []
+        self.overtime_data = [] # (day, num_linacs_in_ot)
+        self.overtime_patients_data = [] # (day, num_patients_in_ot_slots)
         self.patients_started = 0
         self.wait_times = [] # To store waiting times for analysis
         self.on_treatment_count = 0
         self.next_patient_id = 0
-        self.active_treatments = {} # Maps patient_id -> process
+        self.active_treatments = {} # Maps patient_id -> (process, linac_id)
+        self.linac_patients = [[] for _ in range(num_linacs)] # List of patient IDs on each LINAC
+        self.next_linac_idx = 0 # For round-robin assignment
+        # Overtime stats
+        self.overtime_backlog_threshold = 10
+        self.overtime_active_linacs = 0
+        self.total_linac_overtime_days = 0
+        self.overtime_active_days = 0
+        self.overtime_slots_per_linac = 2 * self.patients_per_hour_linac
 
 # --- Patient Process ---
 def patient_intake(env, center, weekly_new_patients, treatment_duration_weights):
@@ -82,14 +93,20 @@ def treatment_scheduler(env, center):
         # 2. Wait for a treatment slot to free up.
         yield center.treatment_slots.get(1)
 
-        # 3. Start the patient's treatment.
-        env.process(patient_treatment_process(env, center, patient))
+        # 3. Assign patient to the next available LINAC in a round-robin fashion.
+        linac_id = center.next_linac_idx
+        center.next_linac_idx = (center.next_linac_idx + 1) % len(center.linac_patients)
 
-def patient_treatment_process(env, center, patient):
+        # 4. Start the patient's treatment on the assigned LINAC.
+        env.process(patient_treatment_process(env, center, patient, linac_id))
+
+def patient_treatment_process(env, center, patient, linac_id):
     """Represents the actual treatment course for a single patient, which can be interrupted."""
     center.patients_started += 1
     center.on_treatment_count += 1
-    center.active_treatments[patient.id] = env.active_process
+    # Register the patient as active on the assigned LINAC
+    center.active_treatments[patient.id] = (env.active_process, linac_id)
+    center.linac_patients[linac_id].append(patient.id)
 
     remaining_duration = patient.treatment_duration_days
     while remaining_duration > 0:
@@ -107,29 +124,31 @@ def patient_treatment_process(env, center, patient):
             remaining_duration += 1
 
     # Treatment is done, clean up.
+    center.linac_patients[linac_id].remove(patient.id)
     del center.active_treatments[patient.id]
     yield center.treatment_slots.put(1)
     center.on_treatment_count -= 1
 
 # --- Breakdown Process ---
-def linac_breakdown_process(env, center, breakdown_impact):
-    """A process for a single LINAC, causing one random breakdown per week."""
+def linac_breakdown_process(env, center, breakdown_impact, linac_id):
+    """A process for a single LINAC, causing one random breakdown per week on THIS machine."""
     while True:
         # Wait for a random time within the 5-day working week.
         random_delay_in_week = random.uniform(0, 5)
         yield env.timeout(random_delay_in_week)
 
-        # Trigger the breakdown: interrupt a number of patients
-        num_active_patients = len(center.active_treatments)
-        if num_active_patients > 0:
+        # Get patients currently assigned to this specific LINAC
+        patients_on_this_linac = center.linac_patients[linac_id]
+        if patients_on_this_linac:
             # A single linac breakdown impacts a number of patients equal to its lost session capacity.
-            num_to_interrupt = min(breakdown_impact, num_active_patients)
-            patients_to_interrupt_ids = random.sample(list(center.active_treatments.keys()), k=num_to_interrupt)
+            num_to_interrupt = min(breakdown_impact, len(patients_on_this_linac))
+            patients_to_interrupt_ids = random.sample(patients_on_this_linac, k=num_to_interrupt)
+
             for pid in patients_to_interrupt_ids:
                 # Check if patient still exists, as they might have finished treatment
                 # between sampling and interruption.
                 if pid in center.active_treatments:
-                    center.active_treatments[pid].interrupt()
+                    center.active_treatments[pid][0].interrupt() # Interrupt the process
 
         # Wait for the rest of the week to pass before the next cycle.
         yield env.timeout(5 - random_delay_in_week)
@@ -145,10 +164,42 @@ def closure_day_process(env, center):
         active_patient_ids = list(center.active_treatments.keys())
         for pid in active_patient_ids:
             if pid in center.active_treatments:
-                center.active_treatments[pid].interrupt()
+                center.active_treatments[pid][0].interrupt()
 
         # Wait for the next closure day (4 weeks later).
         yield env.timeout(20)
+
+# --- Overtime Process ---
+def overtime_manager(env, center, num_linacs, p_per_hr):
+    """Monitors backlog and adds/removes overtime capacity dynamically."""
+    while True:
+        # Check conditions at the start of each day
+        backlog_size = len(center.backlog.items)
+
+        # --- Logic to ADD overtime ---
+        # If backlog is high and we have capacity for more overtime
+        if backlog_size > center.overtime_backlog_threshold and center.overtime_active_linacs < num_linacs:
+            # Add one LINAC to overtime
+            center.overtime_active_linacs += 1
+            # Add its capacity to the treatment slots. This is non-blocking.
+            yield center.treatment_slots.put(center.overtime_slots_per_linac)
+
+        # --- Logic to REMOVE overtime ---
+        # If backlog is low and overtime is active
+        elif backlog_size <= center.overtime_backlog_threshold and center.overtime_active_linacs > 0:
+            # We will try to remove one LINAC's worth of overtime capacity.
+            # This will block until enough patients finish treatment to free up
+            # these slots. This correctly models scaling down.
+            yield center.treatment_slots.get(center.overtime_slots_per_linac)
+            center.overtime_active_linacs -= 1
+
+        # --- Statistics Tracking ---
+        if center.overtime_active_linacs > 0:
+            center.overtime_active_days += 1
+            center.total_linac_overtime_days += center.overtime_active_linacs
+
+        # Check once per day
+        yield env.timeout(1)
 
 # --- Monitoring Process ---
 def monitor(env, center):
@@ -156,8 +207,13 @@ def monitor(env, center):
     while True:
         center.backlog_data.append((env.now, len(center.backlog.items)))
 
-        # Calculate patients currently on treatment (capacity - available slots)
+        # Record patients currently on treatment
         center.on_treatment_data.append((env.now, center.on_treatment_count))
+
+        # Record overtime status for plotting
+        center.overtime_data.append((env.now, center.overtime_active_linacs))
+        ot_patients = center.overtime_active_linacs * center.overtime_slots_per_linac
+        center.overtime_patients_data.append((env.now, ot_patients))
 
         yield env.timeout(1) # Record daily
 
@@ -195,11 +251,14 @@ def run_simulation(params):
     # Start one scheduler process. It will handle all slot assignments.
     env.process(treatment_scheduler(env, center))
     # Start an independent, random breakdown process for each LINAC
-    for _ in range(num_linacs):
-        env.process(linac_breakdown_process(env, center, breakdown_impact))
+    for i in range(num_linacs):
+        env.process(linac_breakdown_process(env, center, breakdown_impact, i))
 
     # Start the scheduled closure day process
     env.process(closure_day_process(env, center))
+
+    # Start the overtime manager process
+    env.process(overtime_manager(env, center, num_linacs, p_per_hr))
 
     # Run the simulation
     sim_duration_days = sim_weeks * 5 # 5 working days per week
@@ -225,6 +284,15 @@ def format_results(center, sim_time_weeks):
         max_wait_days = max(center.wait_times)
         results.append(f"Average patient wait time: {avg_wait_days:.2f} working days")
         results.append(f"Maximum patient wait time: {max_wait_days:.2f} working days")
+
+    results.append("\n--- Overtime Statistics ---")
+    results.append(f"Total days with active overtime: {center.overtime_active_days}")
+    results.append(f"Total LINAC-days of overtime: {center.total_linac_overtime_days}")
+    if center.overtime_active_days > 0:
+        avg_linacs = center.total_linac_overtime_days / center.overtime_active_days
+        results.append(f"Average LINACs in overtime on active days: {avg_linacs:.2f}")
+    else:
+        results.append("No overtime was required.")
 
     return "\n".join(results)
 
@@ -316,7 +384,7 @@ class SimulationApp(tk.Tk):
         results_frame.grid(row=2, column=0, columnspan=2, sticky=(tk.W, tk.E))
         results_frame.columnconfigure(0, weight=1)
 
-        self.results_text = tk.Text(results_frame, wrap=tk.WORD, height=5)
+        self.results_text = tk.Text(results_frame, wrap=tk.WORD, height=8)
         self.results_text.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
 
         # --- Plot Frame ---
@@ -387,15 +455,20 @@ class SimulationApp(tk.Tk):
         results_str = format_results(center, int(params['sim_time_weeks']))
 
         # Schedule the GUI update to run in the main thread
-        self.after(0, self.update_gui, results_str, center.backlog_data, center.on_treatment_data)
+        self.after(0, self.update_gui, results_str, center)
 
-    def update_gui(self, results_str, backlog_data, on_treatment_data):
+    def update_gui(self, results_str, center):
         # Update the text results
         self.results_text.delete("1.0", tk.END)
         self.results_text.insert(tk.END, results_str)
 
         # Update the plot
         self.ax.clear()
+
+        # --- Plot Main Data Lines ---
+        backlog_data = center.backlog_data
+        on_treatment_data = center.on_treatment_data
+        overtime_patients_data = center.overtime_patients_data
 
         if backlog_data:
             days, backlog_sizes = zip(*backlog_data)
@@ -404,6 +477,10 @@ class SimulationApp(tk.Tk):
         if on_treatment_data:
             days, on_treatment_sizes = zip(*on_treatment_data)
             self.ax.plot(days, on_treatment_sizes, label='Patients on Treatment', marker='.', linestyle='-', markersize=4)
+
+        if overtime_patients_data:
+            days, ot_patients = zip(*overtime_patients_data)
+            self.ax.plot(days, ot_patients, label='Patients in Overtime Slots', color='purple', linestyle='--', markersize=4)
 
         self.ax.set_xlabel("Time (Working Days)")
         self.ax.set_ylabel("Number of Patients")
